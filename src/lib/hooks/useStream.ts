@@ -1,10 +1,10 @@
-import {useQuery} from '@tanstack/react-query';
-import {useState, useEffect, useMemo} from 'react';
-import {ToastAndroid} from 'react-native';
-import {providerManager} from '../services/ProviderManager';
-import {settingsStorage} from '../storage';
-import {ifExists} from '../file/ifExists';
-import {Stream} from '../providers/types';
+import { useQuery } from '@tanstack/react-query';
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import { ToastAndroid } from 'react-native';
+import { providerManager } from '../services/ProviderManager';
+import { settingsStorage } from '../storage';
+import { ifExists } from '../file/ifExists';
+import { Stream } from '../providers/types';
 
 interface UseStreamOptions {
   activeEpisode: any;
@@ -43,7 +43,7 @@ export const useStream = ({
       // Handle direct URL (downloaded content)
       if (routeParams?.directUrl) {
         return [
-          {server: 'Downloaded', link: routeParams.directUrl, type: 'mp4'},
+          { server: 'Downloaded', link: routeParams.directUrl, type: 'mp4' },
         ];
       }
 
@@ -57,7 +57,7 @@ export const useStream = ({
 
         const exists = await ifExists(file);
         if (exists) {
-          return [{server: 'downloaded', link: exists, type: 'mp4'}];
+          return [{ server: 'downloaded', link: exists, type: 'mp4' }];
         }
       }
 
@@ -171,7 +171,7 @@ export const useVideoSettings = () => {
   const [selectedTextTrackIndex, setSelectedTextTrackIndex] = useState(1000);
   const [selectedQualityIndex, setSelectedQualityIndex] = useState(1000);
 
-  const processAudioTracks = (tracks: any[]) => {
+  const processAudioTracks = useCallback((tracks: any[]) => {
     const uniqueMap = new Map();
     tracks.forEach(track => {
       const key = `${track.type}-${track.title}-${track.language}`;
@@ -183,7 +183,7 @@ export const useVideoSettings = () => {
       }
 
       if (track.selected && !existingTrack.selected) {
-        uniqueMap.set(key, {...existingTrack, ...track, selected: true});
+        uniqueMap.set(key, { ...existingTrack, ...track, selected: true });
       }
     });
 
@@ -194,9 +194,9 @@ export const useVideoSettings = () => {
     if (selectedIndex !== -1) {
       setSelectedAudioTrackIndex(selectedIndex);
     }
-  };
+  }, []);
 
-  const processVideoTracks = (tracks: any[]) => {
+  const processVideoTracks = useCallback((tracks: any[]) => {
 
     if (!tracks || tracks.length === 0) {
       return;
@@ -210,12 +210,12 @@ export const useVideoSettings = () => {
       }
       return false;
     });
-        console.log('Processing video tracks:', uniqueTracks);
+    console.log('Processing video tracks:', uniqueTracks);
     setVideoTracks(uniqueTracks);
-  };
+  }, []);
 
 
-  const handleVideoLoad = (naturalSize?: {width?: number; height?: number}) => {
+  const handleVideoLoad = useCallback((naturalSize?: { width?: number; height?: number }) => {
     if (!naturalSize?.height) {
       return;
     }
@@ -223,13 +223,13 @@ export const useVideoSettings = () => {
       width: naturalSize.width ?? 0,
       height: naturalSize.height ?? 0,
     });
-  };
+  }, []);
 
   // Clear everything when switching to a new stream/episode.
-  const resetVideoTracks = () => {
+  const resetVideoTracks = useCallback(() => {
     setVideoTracks([]);
     setLoadedVideoSize(null);
-  };
+  }, []);
 
 
   const effectiveVideoTracks = useMemo(() => {

@@ -23,16 +23,13 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../../App';
 import { cacheStorage, settingsStorage } from '../../lib/storage';
 import { OrientationLocker, LANDSCAPE } from 'react-native-orientation-locker';
-import VideoPlayer from '@8man/react-native-media-console';
+import VideoPlayer from '../../components/VideoPlayer';
+import { SettingsModal } from '../../components/VideoPlayer/components/SettingsModal';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import {
-  VideoRef,
-  SelectedVideoTrack,
-  SelectedVideoTrackType,
-  ResizeMode,
-  SelectedTrack,
-  SelectedTrackType,
+  useVideoPlayer,
+  useEvent,
 } from 'react-native-video';
 import useContentStore from '../../lib/zustand/contentStore';
 // import {CastButton, useRemoteMediaClient} from 'react-native-google-cast';
@@ -93,15 +90,59 @@ const reapplyFullscreenMode = (isFullScreenEnabled: boolean) => {
   }
 };
 
+// react-native-video v7 expects external subtitles under `externalSubtitles`
+// with a `label` + short `type` ('vtt' | 'srt' | 'ssa' | 'ass' | 'auto'), not the
+// v6 `textTracks` shape ({ title, type: <mime>, language, uri }). Map between them.
+const SUBTITLE_MIME_TO_TYPE: Record<string, string> = {
+  'text/vtt': 'vtt',
+  'application/x-subrip': 'srt',
+  'application/ttml+xml': 'auto',
+};
+
+const V7_SUBTITLE_TYPES = ['vtt', 'srt', 'ssa', 'ass', 'auto'];
+
+const mapExternalSubtitles = (subs: any[]) => {
+  if (!subs?.length) {
+    return [];
+  }
+  return subs
+    .filter(sub => sub?.uri)
+    .map(sub => {
+      let type = sub.type;
+      if (type && SUBTITLE_MIME_TO_TYPE[type]) {
+        type = SUBTITLE_MIME_TO_TYPE[type];
+      } else if (!V7_SUBTITLE_TYPES.includes(type)) {
+        const uri = String(sub.uri).toLowerCase();
+        if (uri.endsWith('.vtt')) {
+          type = 'vtt';
+        } else if (uri.endsWith('.ass')) {
+          type = 'ass';
+        } else if (uri.endsWith('.ssa')) {
+          type = 'ssa';
+        } else {
+          type = 'srt';
+        }
+      }
+      return {
+        uri: sub.uri,
+        label: sub.title || sub.label || sub.language || 'Subtitle',
+        type,
+        language: sub.language || 'und',
+      };
+    });
+};
+
 const Player = ({ route }: Props): React.JSX.Element => {
   const { primary } = useThemeStore(state => state);
   const { provider } = useContentStore();
   const navigation = useNavigation();
-  const { addItem, updatePlaybackInfo, updateItemWithInfo } =
-    useWatchHistoryStore();
+  const addItem = useWatchHistoryStore(state => state.addItem);
+  const updatePlaybackInfo = useWatchHistoryStore(state => state.updatePlaybackInfo);
+  const updateItemWithInfo = useWatchHistoryStore(state => state.updateItemWithInfo);
 
   // Player ref
-  const playerRef = useRef<VideoRef>(null as unknown as VideoRef);
+
+
   const hasSetInitialTracksRef = useRef(false);
 
   // Shared values for animations
@@ -229,11 +270,7 @@ const Player = ({ route }: Props): React.JSX.Element => {
     updatePlaybackInfo,
   });
 
-  // Memoized values
-  const playbacks = useMemo(
-    () => [0.25, 0.5, 1.0, 1.25, 1.35, 1.5, 1.75, 2],
-    [],
-  );
+
   const hideSeekButtons = useMemo(
     () => settingsStorage.hideSeekButtons() || false,
     [],
@@ -255,19 +292,7 @@ const Player = ({ route }: Props): React.JSX.Element => {
   }, [activeEpisode?.link]);
 
   // Memoized selected tracks
-  const [selectedAudioTrack, setSelectedAudioTrack] = useState<SelectedTrack>({
-    type: SelectedTrackType.INDEX,
-    value: 0,
-  });
 
-  const [selectedTextTrack, setSelectedTextTrack] = useState<SelectedTrack>({
-    type: SelectedTrackType.DISABLED,
-  });
-
-  const [selectedVideoTrack, setSelectedVideoTrack] =
-    useState<SelectedVideoTrack>({
-      type: SelectedVideoTrackType.AUTO,
-    });
 
   const [processedStreamUrl, setProcessedStreamUrl] = useState<string>('');
   const progressIntervalRef = useRef<any>(null);
@@ -435,7 +460,13 @@ const Player = ({ route }: Props): React.JSX.Element => {
   // Memoized error handler
   const handleVideoError = useCallback(
     (e: any) => {
-      console.log('PlayerError', e);
+      // Ignore errors from the placeholder source used before the real stream
+      // loads, so we don't wrongly bail out / navigate back.
+      if (!processedStreamUrl) {
+        console.log('🎥 [Player] Ignoring error from placeholder source:', e);
+        return;
+      }
+      console.log('🎥 [Player] PlayerError (onError event):', e);
       if (!switchToNextStream()) {
         ToastAndroid.show(
           'Video could not be played, try again later',
@@ -445,7 +476,7 @@ const Player = ({ route }: Props): React.JSX.Element => {
       }
       setShowControls(true);
     },
-    [switchToNextStream, navigation, setShowControls],
+    [switchToNextStream, navigation, setShowControls, processedStreamUrl],
   );
 
   // Memoized cast effect
@@ -485,6 +516,119 @@ const Player = ({ route }: Props): React.JSX.Element => {
   //   playbackRate,
   //   route.params,
   // ]);
+
+  // Construct source for useVideoPlayer
+  const videoSource = useMemo(() => {
+    if (!processedStreamUrl) {
+      return { uri: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8' }; // dummy valid URL to prevent useVideoPlayer crash
+    }
+    const isLocalFile = processedStreamUrl.startsWith('file://') || processedStreamUrl.startsWith('/');
+    console.log('🎥 [Player] Constructing videoSource:', { processedStreamUrl, isLocalFile, externalSubsLength: externalSubs?.length });
+    return {
+      uri: processedStreamUrl,
+      headers: selectedStream?.headers,
+      externalSubtitles: mapExternalSubtitles(externalSubs),
+      // Tuned buffer sizes for smooth remote/HLS playback. react-native-video v7
+      // defaults are very small (max 10s), which causes constant re-buffering that
+      // feels like lag. Local files don't need this.
+      ...(isLocalFile
+        ? {}
+        : {
+            bufferConfig: {
+              minBufferMs: 15000,
+              maxBufferMs: 60000,
+              bufferForPlaybackMs: 2500,
+              bufferForPlaybackAfterRebufferMs: 5000,
+              backBufferDurationMs: 30000,
+            },
+          }),
+      metadata: {
+        title: route.params?.primaryTitle,
+        subtitle: activeEpisode?.title,
+        artist: activeEpisode?.title,
+        description: activeEpisode?.title,
+        imageUri: route.params?.poster?.poster,
+      },
+    };
+  }, [processedStreamUrl, externalSubs, selectedStream, route.params, activeEpisode]);
+
+  const player = useVideoPlayer(videoSource, (p) => {
+    p.loop = false;
+    // Only autoplay the real stream. `videoSource` falls back to a placeholder
+    // remote clip before the real URL resolves (an empty uri throws in v7); that
+    // placeholder must stay silent so it doesn't leak audio or steal the initial
+    // play/seek from the real video.
+    if (processedStreamUrl) {
+      console.log('🎥 [Player] useVideoPlayer setup: starting playback');
+      p.play();
+    }
+  });
+
+  const handleVideoProgress = useCallback((e: any) => {
+    // v7 onProgress only carries { currentTime, bufferDuration }. The total
+    // duration for watch-history must come from the player itself.
+    let totalDuration = 0;
+    try {
+      totalDuration = player.duration || 0;
+    } catch (err) {
+      totalDuration = 0;
+    }
+    handleProgress({ currentTime: e.currentTime, seekableDuration: totalDuration });
+  }, [handleProgress, player]);
+
+  const hasSeeked = useRef(false);
+
+  useEffect(() => {
+    // Reset seek state when stream changes (e.g. next episode)
+    hasSeeked.current = false;
+  }, [processedStreamUrl]);
+
+  const handleVideoLoadComplete = useCallback((e: any) => {
+    // Ignore load events from the placeholder source that runs before the real
+    // stream URL resolves - otherwise it consumes the initial seek/play and the
+    // real video ends up paused.
+    if (!processedStreamUrl) {
+      console.log('🎥 [Player] Ignoring onLoad from placeholder source');
+      return;
+    }
+    console.log('🎥 [Player] onLoad complete! Size:', e?.width, 'x', e?.height, 'Duration:', e?.duration);
+    // v7 onLoad exposes width/height directly (v6 used naturalSize).
+    handleVideoLoad({ width: e?.width, height: e?.height });
+
+    try {
+      // Resume to the saved position only once per stream.
+      if (!hasSeeked.current) {
+        const videoDuration = e?.duration || 0;
+        let targetTime = watchedDuration;
+
+        // If they finished the video (within 10 seconds of end), start over.
+        if (videoDuration > 0 && videoDuration - watchedDuration < 10) {
+          targetTime = 0;
+          console.log('🎥 [Player] Video previously finished, restarting from beginning.');
+        } else if (targetTime > 0) {
+          console.log('🎥 [Player] onLoad seeking to watchedDuration:', targetTime);
+        }
+
+        // seekTo() is absolute; seekBy() is relative. Jump to the saved position.
+        if (targetTime > 0) {
+          player.seekTo(targetTime);
+        }
+        hasSeeked.current = true;
+      }
+
+      // Always start playback once the real video is ready (this is what was
+      // missing: the old early-return skipped play() on subsequent loads).
+      player.play();
+      player.rate = 1.0;
+    } catch (err) {
+      console.log('🎥 [Player] onLoad seek/play error:', err);
+    }
+  }, [handleVideoLoad, watchedDuration, player, processedStreamUrl]);
+
+  // Use events for business logic
+  useEvent(player, 'onProgress', handleVideoProgress);
+  useEvent(player, 'onLoad', handleVideoLoadComplete);
+  useEvent(player, 'onError', handleVideoError);
 
   // Exit fullscreen on back
   useFocusEffect(
@@ -602,18 +746,10 @@ const Player = ({ route }: Props): React.JSX.Element => {
     );
 
     if (audioTrackIndex !== -1) {
-      setSelectedAudioTrack({
-        type: SelectedTrackType.INDEX,
-        value: audioTrackIndex,
-      });
       setSelectedAudioTrackIndex(audioTrackIndex);
     }
 
     if (textTrackIndex !== -1) {
-      setSelectedTextTrack({
-        type: SelectedTrackType.INDEX,
-        value: textTrackIndex,
-      });
       setSelectedTextTrackIndex(textTrackIndex);
     }
 
@@ -722,29 +858,8 @@ const Player = ({ route }: Props): React.JSX.Element => {
       doubleTapTime: 200,
       disableSeekButtons: isPlayerLocked || hideSeekButtons,
       showOnStart: !isPlayerLocked,
-      source: {
-        textTracks: externalSubs,
-        uri: processedStreamUrl || '',
-        bufferConfig: { backBufferDurationMs: 30000 },
-        shouldCache: true,
-        ...(selectedStream?.type === 'm3u8' && { type: 'm3u8' }),
-        headers: selectedStream?.headers,
-        metadata: {
-          title: route.params?.primaryTitle,
-          subtitle: activeEpisode?.title,
-          artist: activeEpisode?.title,
-          description: activeEpisode?.title,
-          imageUri: route.params?.poster?.poster,
-        },
-      },
-      onProgress: handleProgress,
-      onLoad: (e: any) => {
-        handleVideoLoad(e?.naturalSize);
-        playerRef?.current?.seek(watchedDuration);
-        playerRef?.current?.resume();
-        setPlaybackRate(1.0);
-      },
-      videoRef: playerRef,
+      player,
+      resizeMode,
       rate: playbackRate,
       poster: route.params?.poster?.logo || '',
       subtitleStyle: {
@@ -775,18 +890,33 @@ const Player = ({ route }: Props): React.JSX.Element => {
       showHours: true,
       progressUpdateInterval: 1000,
       showNotificationControls: showMediaControls,
-      onError: handleVideoError,
-      resizeMode,
-      selectedAudioTrack,
-      onAudioTracks: (e: any) => processAudioTracks(e.audioTracks),
-      selectedTextTrack,
-      onTextTracks: (e: any) => setTextTracks(e.textTracks),
-      onVideoTracks: (e: any) => processVideoTracks(e.videoTracks),
-      selectedVideoTrack,
       style: { flex: 1, zIndex: 100 },
       controlAnimationTiming: 357,
       controlTimeoutDelay: 10000,
       hideAllControlls: isPlayerLocked,
+      // settingsProps moved out of VideoPlayer to render on top
+      bottomBarProps: {
+        audioTracks,
+        textTracks,
+        videoTracks,
+        selectedAudioTrackIndex,
+        selectedTextTrackIndex,
+        selectedQualityIndex,
+        playbackRate,
+        resizeMode,
+        handleResizeMode,
+        showSettings,
+        setShowSettings,
+        setActiveTab,
+        isPlayerLocked,
+        onNextEpisode: handleNextEpisode,
+        showNextEpisode: route.params?.episodeList?.indexOf(activeEpisode) <
+          route.params?.episodeList?.length - 1 &&
+          videoPositionRef.current.position /
+          videoPositionRef.current.duration >
+          0.8,
+        formatQuality,
+      },
     }),
     [
       isPlayerLocked,
@@ -806,13 +936,11 @@ const Player = ({ route }: Props): React.JSX.Element => {
       showMediaControls,
       handleVideoError,
       resizeMode,
-      selectedAudioTrack,
-      selectedTextTrack,
-      selectedVideoTrack,
       processAudioTracks,
       processVideoTracks,
       handleVideoLoad,
       processedStreamUrl,
+      player,
     ],
   );
 
@@ -875,190 +1003,92 @@ const Player = ({ route }: Props): React.JSX.Element => {
       <StatusBar translucent={true} hidden={true} />
       <OrientationLocker orientation={LANDSCAPE} />
 
-      {/* Video Player */}
-      <VideoPlayer {...videoPlayerProps} />
+      {/* Video Player Main View */}
+      {/* `player` is passed explicitly (not just via the spread) so the VideoView
+          always binds to the current player instance. useVideoPlayer creates a new
+          instance whenever the source changes; if the memoized props lag behind,
+          the view renders a released player and playback appears frozen. */}
+      <VideoPlayer {...videoPlayerProps} player={player}>
 
-      {/* Non-intrusive Torrent Status Overlay */}
-      {selectedStream?.type === 'torrent' && !streamLoading && torrentState !== 'seeding' && torrentState !== 'finished' && (
-        <Animated.View
-          className="absolute top-4 self-center px-3 py-1.5 rounded-full items-center"
-          style={controlsOpacityStyle}
-          pointerEvents="none">
+        {/* Non-intrusive Torrent Status Overlay */}
+        {selectedStream?.type === 'torrent' && !streamLoading && torrentState !== 'seeding' && torrentState !== 'finished' && (
+          <Animated.View
+            className="absolute top-4 self-center px-3 py-1.5 rounded-full items-center"
+            style={controlsOpacityStyle}
+            pointerEvents="none">
 
-          {torrentState !== 'Fetching Metadata...' ? (
-            <Text className="text-white/70 text-[10px] mt-0.5">
-              {torrentDownloaded > 0 ? `${torrentDownloaded.toFixed(1)} MB` : ''}
-              {torrentDownloadSpeed > 0 ? ` @ ${(torrentDownloadSpeed / 1024 / 1024).toFixed(1)} MB/s` : ''}
-            </Text>
-          )
-            :
-            (<Text className="text-white/90 text-xs font-medium">
-              {torrentState === 'Fetching Metadata...' ? 'Fetching Metadata' : ''}
-            </Text>
-            )}
-        </Animated.View>
-      )}
+            {torrentState !== 'Fetching Metadata...' ? (
+              <Text className="text-white/70 text-[10px] mt-0.5">
+                {torrentDownloaded > 0 ? `${torrentDownloaded.toFixed(1)} MB` : ''}
+                {torrentDownloadSpeed > 0 ? ` @ ${(torrentDownloadSpeed / 1024 / 1024).toFixed(1)} MB/s` : ''}
+              </Text>
+            )
+              :
+              (<Text className="text-white/90 text-xs font-medium">
+                {torrentState === 'Fetching Metadata...' ? 'Fetching Metadata' : ''}
+              </Text>
+              )}
+          </Animated.View>
+        )}
 
-      {/* Full-screen overlay to detect taps when locked */}
-      {isPlayerLocked && (
-        <TouchableOpacity
-          activeOpacity={1}
-          onPress={handleLockedScreenTap}
-          className="absolute top-0 left-0 right-0 bottom-0 z-40 bg-transparent"
-        />
-      )}
-
-      {/* Lock/Unlock button */}
-      {!streamLoading && !Platform.isTV && (
-        <Animated.View
-          style={[lockButtonStyle]}
-          className="absolute top-5 right-5 flex-row items-center gap-2 z-50">
+        {/* Full-screen overlay to detect taps when locked */}
+        {isPlayerLocked && (
           <TouchableOpacity
-            onPress={togglePlayerLock}
-            className="opacity-70 p-2 rounded-full">
-            <MaterialIcons
-              name={isPlayerLocked ? 'lock' : 'lock-open'}
-              color={'hsl(0, 0%, 70%)'}
-              size={24}
-            />
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={toggleFullScreen}
-            className="opacity-70 p-2 rounded-full">
-            <MaterialIcons
-              name={isFullScreen ? 'fullscreen-exit' : 'fullscreen'}
-              color={'hsl(0, 0%, 70%)'}
-              size={24}
-            />
-          </TouchableOpacity>
-          {/* {!isPlayerLocked && (
+            activeOpacity={1}
+            onPress={handleLockedScreenTap}
+            className="absolute top-0 left-0 right-0 bottom-0 z-40 bg-transparent"
+          />
+        )}
+
+        {/* Lock/Unlock button */}
+        {!streamLoading && !Platform.isTV && (
+          <Animated.View
+            style={[lockButtonStyle]}
+            className="absolute top-5 right-5 flex-row items-center gap-2 z-50">
+            <TouchableOpacity
+              onPress={togglePlayerLock}
+              className="opacity-70 p-2 rounded-full">
+              <MaterialIcons
+                name={isPlayerLocked ? 'lock' : 'lock-open'}
+                color={'hsl(0, 0%, 70%)'}
+                size={24}
+              />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={toggleFullScreen}
+              className="opacity-70 p-2 rounded-full">
+              <MaterialIcons
+                name={isFullScreen ? 'fullscreen-exit' : 'fullscreen'}
+                color={'hsl(0, 0%, 70%)'}
+                size={24}
+              />
+            </TouchableOpacity>
+            {/* {!isPlayerLocked && (
             <CastButton
               style={{width: 40, height: 40, opacity: 0.5, tintColor: 'white'}}
             />
           )} */}
-        </Animated.View>
-      )}
+          </Animated.View>
+        )}
 
-      {/* Bottom controls */}
-      {!isPlayerLocked && (
-        <Animated.View
-          style={[controlsStyle]}
-          className="absolute bottom-3 right-6 flex flex-row justify-center w-full gap-x-16">
-          {/* Audio controls */}
-          <TouchableOpacity
-            onPress={() => {
-              setActiveTab('audio');
-              setShowSettings(!showSettings);
-            }}
-            className="flex flex-row gap-x-1 items-center">
-            <MaterialIcons
-              style={{ opacity: 0.7 }}
-              name={'multitrack-audio'}
-              size={26}
-              color="white"
-            />
-            <Text className="capitalize text-xs text-white opacity-70">
-              {audioTracks[selectedAudioTrackIndex]?.language || 'auto'}
-            </Text>
-          </TouchableOpacity>
+      </VideoPlayer>
 
-          {/* Subtitle controls */}
-          <TouchableOpacity
-            onPress={() => {
-              setActiveTab('subtitle');
-              setShowSettings(!showSettings);
-            }}
-            className="flex flex-row gap-x-1 items-center">
-            <MaterialIcons
-              style={{ opacity: 0.6 }}
-              name={'subtitles'}
-              size={24}
-              color="white"
-            />
-            <Text className="text-xs capitalize text-white opacity-70">
-              {selectedTextTrackIndex === 1000
-                ? 'none'
-                : textTracks[selectedTextTrackIndex]?.language}
-            </Text>
-          </TouchableOpacity>
-
-          {/* Speed controls */}
-          <TouchableOpacity
-            className="flex-row gap-1 items-center opacity-60"
-            onPress={() => {
-              setActiveTab('speed');
-              setShowSettings(!showSettings);
-            }}>
-            <MaterialIcons name="speed" size={26} color="white" />
-            <Text className="text-white text-sm">
-              {playbackRate === 1 ? '1.0' : playbackRate}
-            </Text>
-          </TouchableOpacity>
-
-          {/* PIP */}
-          {!Platform.isTV && (
-            <TouchableOpacity
-              className="flex-row gap-1 items-center opacity-60"
-              onPress={() => {
-                playerRef?.current?.enterPictureInPicture();
-              }}>
-              <MaterialIcons
-                name="picture-in-picture"
-                size={24}
-                color="white"
-              />
-              <Text className="text-white text-xs">PIP</Text>
-            </TouchableOpacity>
-          )}
-
-          {/* Server & Quality */}
-          <TouchableOpacity
-            className="flex-row gap-1 items-center opacity-60"
-            onPress={() => {
-              setActiveTab('server');
-              setShowSettings(!showSettings);
-            }}>
-            <MaterialIcons name="video-settings" size={25} color="white" />
-            <Text className="text-xs text-white capitalize">
-              {videoTracks?.length === 1
-                ? formatQuality(videoTracks[0]?.height?.toString() || 'auto')
-                : formatQuality(
-                  videoTracks?.[selectedQualityIndex]?.height?.toString() ||
-                  'auto',
-                )}
-            </Text>
-          </TouchableOpacity>
-
-          {/* Resize button */}
-          <TouchableOpacity
-            className="flex-row gap-1 items-center opacity-60"
-            onPress={handleResizeMode}>
-            <MaterialIcons name="fit-screen" size={28} color="white" />
-            <Text className="text-white text-sm min-w-[38px]">
-              {resizeMode === ResizeMode.NONE
-                ? 'Fit'
-                : resizeMode === ResizeMode.COVER
-                  ? 'Cover'
-                  : resizeMode === ResizeMode.STRETCH
-                    ? 'Stretch'
-                    : 'Contain'}
-            </Text>
-          </TouchableOpacity>
-
-          {/* Next episode button */}
-          {route.params?.episodeList?.indexOf(activeEpisode) <
-            route.params?.episodeList?.length - 1 &&
-            videoPositionRef.current.position /
-            videoPositionRef.current.duration >
-            0.8 && (
-              <TouchableOpacity
-                className="flex-row items-center opacity-60"
-                onPress={handleNextEpisode}>
-                <Text className="text-white text-base">Next</Text>
-                <MaterialIcons name="skip-next" size={28} color="white" />
-              </TouchableOpacity>
-            )}
-        </Animated.View>
+      {/* Settings Modal - rendered outside VideoPlayer for correct z-ordering */}
+      {!streamLoading && !isPlayerLocked && (
+        <SettingsModal
+          player={player}
+          settingsProps={{
+            streamData,
+            selectedStream,
+            onServerSelect: setSelectedStream,
+            externalSubs,
+            setExternalSubs,
+          }}
+          showSettings={showSettings}
+          setShowSettings={setShowSettings}
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+        />
       )}
 
       {/* Toast message */}
@@ -1071,313 +1101,6 @@ const Player = ({ route }: Props): React.JSX.Element => {
         </Text>
       </Animated.View>
 
-      {/* Settings Modal */}
-      {!streamLoading && !isPlayerLocked && showSettings && (
-        <Animated.View
-          style={[settingsStyle]}
-          className="absolute opacity-0 top-0 left-0 w-full h-full bg-black/20 justify-end items-center"
-          onTouchEnd={() => setShowSettings(false)}>
-          <View
-            className="bg-black p-3 w-[600px] h-72 rounded-t-lg flex-row justify-start items-center"
-            onTouchEnd={e => e.stopPropagation()}>
-            {/* Audio Tab */}
-            {activeTab === 'audio' && (
-              <ScrollView className="w-full h-full p-1 px-4">
-                <Text className="text-lg font-bold text-center text-white">
-                  Audio
-                </Text>
-                {audioTracks.length === 0 && (
-                  <View className="flex justify-center items-center">
-                    <Text className="text-white text-xs">
-                      Loading audio tracks...
-                    </Text>
-                  </View>
-                )}
-                {audioTracks.map((track, i) => (
-                  <TouchableOpacity
-                    className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-2"
-                    key={i}
-                    onPress={() => {
-                      setSelectedAudioTrack({
-                        type: SelectedTrackType.LANGUAGE,
-                        value: track.language,
-                      });
-                      cacheStorage.setString(
-                        'lastAudioTrack',
-                        track.language || '',
-                      );
-                      setSelectedAudioTrackIndex(i);
-                      setShowSettings(false);
-                    }}>
-                    <Text
-                      className={'text-lg font-semibold'}
-                      style={{
-                        color:
-                          selectedAudioTrackIndex === i ? primary : 'white',
-                      }}>
-                      {track.language}
-                    </Text>
-                    <Text
-                      className={'text-base italic'}
-                      style={{
-                        color:
-                          selectedAudioTrackIndex === i ? primary : 'white',
-                      }}>
-                      {track.type}
-                    </Text>
-                    <Text
-                      className={'text-sm italic'}
-                      style={{
-                        color:
-                          selectedAudioTrackIndex === i ? primary : 'white',
-                      }}>
-                      {track.title}
-                    </Text>
-                    {selectedAudioTrackIndex === i && (
-                      <MaterialIcons name="check" size={20} color="white" />
-                    )}
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            )}
-
-            {/* Subtitle Tab */}
-            {activeTab === 'subtitle' && (
-              <FlashList
-                estimatedItemSize={70}
-                data={textTracks}
-                ListHeaderComponent={
-                  <View>
-                    <Text className="text-lg font-bold text-center text-white">
-                      Subtitle
-                    </Text>
-                    <TouchableOpacity
-                      className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-3"
-                      onPress={() => {
-                        setSelectedTextTrack({
-                          type: SelectedTrackType.DISABLED,
-                        });
-                        setSelectedTextTrackIndex(1000);
-                        cacheStorage.setString('lastTextTrack', '');
-                        setShowSettings(false);
-                      }}>
-                      <Text
-                        className="text-base font-semibold"
-                        style={{
-                          color:
-                            selectedTextTrackIndex === 1000 ? primary : 'white',
-                        }}>
-                        Disabled
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-                }
-                ListFooterComponent={
-                  <>
-                    <TouchableOpacity
-                      className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-2"
-                      onPress={async () => {
-                        try {
-                          const res = await DocumentPicker.getDocumentAsync({
-                            type: [
-                              'text/vtt',
-                              'application/x-subrip',
-                              'text/srt',
-                              'application/ttml+xml',
-                            ],
-                            multiple: false,
-                          });
-
-                          if (!res.canceled && res.assets?.[0]) {
-                            const asset = res.assets[0];
-                            const track = {
-                              type: asset.mimeType as any,
-                              title:
-                                asset.name && asset.name.length > 20
-                                  ? asset.name.slice(0, 20) + '...'
-                                  : asset.name || 'undefined',
-                              language: 'und',
-                              uri: asset.uri,
-                            };
-                            setExternalSubs((prev: any) => [track, ...prev]);
-                          }
-                        } catch (err) {
-                          console.log(err);
-                        }
-                      }}>
-                      <MaterialIcons name="add" size={20} color="white" />
-                      <Text className="text-base font-semibold text-white">
-                        Add external file
-                      </Text>
-                    </TouchableOpacity>
-                    <SearchSubtitles
-                      searchQuery={searchQuery}
-                      setSearchQuery={setSearchQuery}
-                      setExternalSubs={setExternalSubs}
-                    />
-                  </>
-                }
-                renderItem={({ item: track }) => (
-                  <TouchableOpacity
-                    className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-2"
-                    onPress={() => {
-                      setSelectedTextTrack({
-                        type: SelectedTrackType.INDEX,
-                        value: track.index,
-                      });
-                      setSelectedTextTrackIndex(track.index);
-                      cacheStorage.setString(
-                        'lastTextTrack',
-                        track.language || '',
-                      );
-                      setShowSettings(false);
-                    }}>
-                    <Text
-                      className={'text-base font-semibold'}
-                      style={{
-                        color:
-                          selectedTextTrackIndex === track.index
-                            ? primary
-                            : 'white',
-                      }}>
-                      {track.language}
-                    </Text>
-                    <Text
-                      className={'text-sm italic'}
-                      style={{
-                        color:
-                          selectedTextTrackIndex === track.index
-                            ? primary
-                            : 'white',
-                      }}>
-                      {track.type}
-                    </Text>
-                    <Text
-                      className={'text-sm italic text-white'}
-                      style={{
-                        color:
-                          selectedTextTrackIndex === track.index
-                            ? primary
-                            : 'white',
-                      }}>
-                      {track.title}
-                    </Text>
-                    {selectedTextTrackIndex === track.index && (
-                      <MaterialIcons name="check" size={20} color="white" />
-                    )}
-                  </TouchableOpacity>
-                )}
-              />
-            )}
-
-            {/* Server Tab */}
-            {activeTab === 'server' && (
-              <View className="flex flex-row w-full h-full p-1 px-4">
-                <ScrollView className="border-r border-white/50">
-                  <Text className="w-full text-center text-white text-lg font-extrabold">
-                    Server
-                  </Text>
-                  {streamData?.length > 0 &&
-                    streamData?.map((track, i) => (
-                      <TouchableOpacity
-                        className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-2"
-                        key={i}
-                        onPress={() => {
-                          setSelectedStream(track);
-                          setShowSettings(false);
-                          playerRef?.current?.resume();
-                        }}>
-                        <Text
-                          className={'text-base capitalize font-semibold'}
-                          style={{
-                            color:
-                              track.link === selectedStream.link
-                                ? primary
-                                : 'white',
-                          }}>
-                          {track.server}
-                        </Text>
-                        {track.link === selectedStream.link && (
-                          <MaterialIcons name="check" size={20} color="white" />
-                        )}
-                      </TouchableOpacity>
-                    ))}
-                </ScrollView>
-
-                <ScrollView>
-                  <Text className="w-full text-center text-white text-lg font-extrabold">
-                    Quality
-                  </Text>
-
-                  {videoTracks &&
-                    videoTracks.map((track: any, i: any) => (
-                      <TouchableOpacity
-                        className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-2"
-                        key={i}
-                        onPress={() => {
-                          setSelectedVideoTrack({
-                            type: SelectedVideoTrackType.INDEX,
-                            value: track.index,
-                          });
-                          setSelectedQualityIndex(i);
-                        }}>
-                        <Text
-                          className={'text-base font-semibold pl-4'}
-                          style={{
-                            color:
-                              selectedQualityIndex === i ? primary : 'white',
-                          }}>
-                          {track.height + 'x' + track.width}
-                        </Text>
-                        <Text
-                          className={''}
-                          style={{
-                            color:
-                              selectedQualityIndex === i ? primary : 'white',
-                          }}>
-                          {!!track.bitrate && `| Bitrate ${track.bitrate}`}
-                          {!!track.codecs && `| Codec ${track.codecs}`}
-                        </Text>
-                        {selectedQualityIndex === i && (
-                          <MaterialIcons name="check" size={20} color="white" />
-                        )}
-                      </TouchableOpacity>
-                    ))}
-                </ScrollView>
-              </View>
-            )}
-
-            {/* Speed Tab */}
-            {activeTab === 'speed' && (
-              <ScrollView className="w-full h-full p-1 px-4">
-                <Text className="text-lg font-bold text-center text-white">
-                  Playback Speed
-                </Text>
-                {playbacks.map((rate, i) => (
-                  <TouchableOpacity
-                    className="flex-row gap-3 items-center rounded-md my-1 overflow-hidden ml-2"
-                    key={i}
-                    onPress={() => {
-                      setPlaybackRate(rate);
-                      setShowSettings(false);
-                    }}>
-                    <Text
-                      className={'text-lg font-semibold'}
-                      style={{
-                        color: playbackRate === rate ? primary : 'white',
-                      }}>
-                      {rate}x
-                    </Text>
-                    {playbackRate === rate && (
-                      <MaterialIcons name="check" size={20} color="white" />
-                    )}
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            )}
-          </View>
-        </Animated.View>
-      )}
     </SafeAreaView>
   );
 };

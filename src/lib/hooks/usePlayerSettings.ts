@@ -27,36 +27,36 @@ export const usePlayerProgress = ({
         duration: seekableDuration,
       };
 
-      // Update playback info for watch history
-      if (
-        routeParams?.episodeList &&
-        routeParams?.linkIndex !== undefined &&
-        !routeParams?.doNotTrack
-      ) {
-        updatePlaybackInfo(
-          routeParams.episodeList[routeParams.linkIndex].link,
-          {
-            currentTime,
-            duration: seekableDuration,
-            playbackRate,
-          },
-        );
-      }
-
-      // Store progress data for watch history display
-      if (!routeParams?.doNotTrack) {
-        storeWatchProgressForHistory(
-          routeParams.episodeList[routeParams.linkIndex].link,
-          currentTime,
-          seekableDuration,
-        );
-      }
-
       // Save progress periodically (every 5 seconds)
       if (
         Math.abs(currentTime - lastSavedPositionRef.current) > 5 ||
         currentTime - lastSavedPositionRef.current > 5
       ) {
+        // Update playback info for watch history (Zustand -> MMKV)
+        if (
+          routeParams?.episodeList &&
+          routeParams?.linkIndex !== undefined &&
+          !routeParams?.doNotTrack
+        ) {
+          updatePlaybackInfo(
+            routeParams.episodeList[routeParams.linkIndex].link,
+            {
+              currentTime,
+              duration: seekableDuration,
+              playbackRate,
+            },
+          );
+        }
+
+        // Store progress data for watch history display (MMKV)
+        if (!routeParams?.doNotTrack) {
+          storeWatchProgressForHistory(
+            routeParams.episodeList[routeParams.linkIndex].link,
+            currentTime,
+            seekableDuration,
+          );
+        }
+
         cacheStorage.setString(
           activeEpisode.link,
           JSON.stringify({

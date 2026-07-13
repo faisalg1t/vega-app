@@ -13,7 +13,7 @@ import React, {useState} from 'react';
 import useThemeStore from '../lib/zustand/themeStore';
 import {ScrollView} from 'react-native';
 import {Dropdown} from 'react-native-element-dropdown';
-import {TextTracks, TextTrackType} from 'react-native-video';
+import {TextTrack} from 'react-native-video';
 
 const SearchSubtitles = ({
   searchQuery,
@@ -22,7 +22,7 @@ const SearchSubtitles = ({
 }: {
   searchQuery: string;
   setSearchQuery: (text: string) => void;
-  setExternalSubs: React.Dispatch<React.SetStateAction<TextTracks>>;
+  setExternalSubs: React.Dispatch<React.SetStateAction<any[]>>;
 }) => {
   const {primary} = useThemeStore(state => state);
   const [searchModalVisible, setSearchModalVisible] = useState(false);
@@ -211,7 +211,7 @@ const SearchSubtitles = ({
                     setSearchModalVisible(false);
                     setExternalSubs(prev => [
                       {
-                        type: TextTrackType.SUBRIP,
+                        type: 'application/x-subrip',
                         language: result?.ISO639,
                         title:
                           result?.InfoReleaseGroup + ' ' + result?.UserNickName,

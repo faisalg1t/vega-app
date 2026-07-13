@@ -15,7 +15,7 @@ import SkeletonLoader from './Skeleton';
 import RNReactNativeHapticFeedback from 'react-native-haptic-feedback';
 import {Clipboard} from 'react-native';
 import useThemeStore from '../lib/zustand/themeStore';
-import {TextTrackType} from 'react-native-video';
+
 import {settingsStorage} from '../lib/storage';
 
 type Props = {
@@ -173,7 +173,7 @@ const DownloadBottomSheet = ({
                                   server: 'Subtitles',
                                   link: item.uri,
                                   type:
-                                    item.type === TextTrackType.VTT
+                                    item.type === 'text/vtt'
                                       ? 'vtt'
                                       : 'srt',
                                   title: item.title,
